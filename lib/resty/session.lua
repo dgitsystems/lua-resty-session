@@ -150,9 +150,14 @@ end
 local function save(session, close)
     session.expires = time() + session.cookie.lifetime
     local i, e, s = session.id, session.expires, session.storage
-    local k = hmac(session.secret, i .. e)
+    local k = hmac(session.secret, i)
     local d = session.serializer.serialize(session.data)
-    local h = hmac(k, concat{ i, e, d, session.key })
+    local dkey
+    if session.data.id_token ~= nil and session.data.id_token.sub ~= nil and session.data.id_token.sub ~= "" then
+        ngx.log(ngx.DEBUG, "using session.data.id_token.sub in place of d in hmac: ", session.data.id_token.sub)
+        dkey = session.data.id_token.sub
+    end
+    local h = hmac(k, concat{ i, e, dkey or d, session.key })
     local cookie, err = s:save(i, e, session.cipher:encrypt(d, k, i, session.key), h, close)
     if cookie then
         return setcookie(session, cookie)
@@ -306,12 +311,27 @@ function session.open(opts)
     self.opened = true
     local cookie = getcookie(self)
     if cookie then
+        ngx.log(ngx.DEBUG, "cookie present: ", cookie)
         local i, e, d, h = self.storage:open(cookie, self.cookie.lifetime)
         if i and e and e > time() and d and h then
-            local k = hmac(self.secret, i .. e)
+            ngx.log(ngx.DEBUG, "cookie session data retrieved")
+            ngx.log(ngx.DEBUG, "i: " .. ngx.encode_base64(i))
+            ngx.log(ngx.DEBUG, "e: " .. e .. " (time: " .. time() .. ")")
+            ngx.log(ngx.DEBUG, "d: " .. ngx.encode_base64(d))
+            ngx.log(ngx.DEBUG, "h: " .. ngx.encode_base64(h))
+            local k = hmac(self.secret, i)
+            ngx.log(ngx.DEBUG, "k: " .. ngx.encode_base64(k))
             d = self.cipher:decrypt(d, k, i, self.key)
-            if d and hmac(k, concat{ i, e, d, self.key }) == h then
+            local dkey, ds = nil, d
+            if d then
+                ngx.log(ngx.DEBUG, "d decrypted: " .. d)
                 d = self.serializer.deserialize(d)
+                if d.id_token ~= nil and d.id_token.sub ~= nil and d.id_token.sub ~= "" then
+                    ngx.log(ngx.DEBUG, "using d.id_token.sub in place of d in hmac: ", d.id_token.sub)
+                    dkey = d.id_token.sub
+                end
+            end
+            if ds and hmac(k, concat{ i, e, dkey or ds, self.key }) == h then
                 self.id = i
                 self.expires = e
                 self.data = type(d) == "table" and d or {}
@@ -320,6 +340,7 @@ function session.open(opts)
             end
         end
     end
+    ngx.log(ngx.DEBUG, "no cookie or invalid session, regenerating and flushing session")
     regenerate(self, true)
     return self, false
 end
