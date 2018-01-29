@@ -88,7 +88,7 @@ function shm:open(cookie, lifetime)
             if ok then
                 local s = self.store
                 local d = s:get(k)
-                s:set(k, d, lifetime)
+--                s:set(k, d, lifetime)
                 l:unlock()
                 return i, e, d, h
             end
@@ -96,7 +96,7 @@ function shm:open(cookie, lifetime)
         else
             local s = self.store
             local d = s:get(k)
-            s:set(k, d, lifetime)
+--            s:set(k, d, lifetime)
             return i, e, d, h
         end
     end

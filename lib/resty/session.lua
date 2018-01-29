@@ -40,6 +40,10 @@ local function prequire(prefix, package, default)
 end
 
 local function setcookie(session, value, expires)
+    if session.basic then
+        return true
+    end
+
     if ngx.headers_sent then return nil, "Attempt to set session cookie after sending out response headers." end
     local c = session.cookie
     local i = 3
@@ -130,6 +134,23 @@ local function setcookie(session, value, expires)
     return true
 end
 
+local function isEmpty(s)
+    return s == nil or s == ''
+end
+
+local function getbasic(session)
+    -- extract the session credentials from basic authorization header
+    local user, pass = var.remote_user, var.remote_passwd
+    if isEmpty(user) or isEmpty(pass) then
+        return
+    end
+
+    ngx.log(ngx.DEBUG, "basic credentials, user: ", user, " password: ", pass)
+    ngx.log(ngx.DEBUG, "session.cookie.lifetime = ", session.cookie.lifetime)
+
+    return session.encoder.encode(user) .. "|" .. time() + session.cookie.lifetime .. "|" .. (session.raw_hmac == true and session.encoder.encode(pass) or pass)
+end
+
 local function getcookie(session, i)
     local name = session.name
     local n = { "cookie_", name }
@@ -151,14 +172,32 @@ local function save(session, close)
     session.expires = time() + session.cookie.lifetime
     local i, e, s = session.id, session.expires, session.storage
     local k = hmac(session.secret, i)
+    if not session.data.hmacsalt then
+        session.data.hmacsalt = ngx.encode_base64(require('resty.session.identifiers.random')({}))
+    end
+    ngx.log(ngx.DEBUG, "session.data.hmacsalt = ", session.data.hmacsalt)
     local d = session.serializer.serialize(session.data)
     local dkey
     if session.data.id_token ~= nil and session.data.id_token.sub ~= nil and session.data.id_token.sub ~= "" then
         ngx.log(ngx.DEBUG, "using session.data.id_token.sub in place of d in hmac: ", session.data.id_token.sub)
         dkey = session.data.id_token.sub
     end
-    local h = hmac(k, concat{ i, e, dkey or d, session.key })
-    local cookie, err = s:save(i, e, session.cipher:encrypt(d, k, i, session.key), h, close)
+    local h = hmac(session.data.hmacsalt .. k, concat{ i, dkey or d, session.key })
+    session.hmac = h
+    local cryptkey
+    if session.check.hmac == false and session.basic then
+        cryptkey = hmac(k, ngx.var.remote_passwd)
+    else
+        cryptkey = hmac(k, h)
+    end
+    local d = session.cipher:encrypt(d, cryptkey, i, session.key)
+    ngx.log(ngx.DEBUG, "i = ", ngx.encode_base64(i))
+    ngx.log(ngx.DEBUG, "e = ", e, " session.cookie.lifetime = ", session.cookie.lifetime)
+    ngx.log(ngx.DEBUG, "d = ", ngx.encode_base64(d))
+    ngx.log(ngx.DEBUG, "h = ", ngx.encode_base64(h))
+    ngx.log(ngx.DEBUG, "k = ", ngx.encode_base64(k))
+    ngx.log(ngx.DEBUG, "cryptkey = " .. ngx.encode_base64(cryptkey))
+    local cookie, err = s:save(i, e, d, h, close)
     if cookie then
         return setcookie(session, cookie)
     end
@@ -166,6 +205,10 @@ local function save(session, close)
 end
 
 local function regenerate(session, flush)
+    if session.basic then
+        return true
+    end
+
     local i = session.present and session.id
     session.id = session:identifier()
     if flush then
@@ -183,7 +226,7 @@ local function init()
     defaults = {
         name       = var.session_name       or "session",
         identifier = var.session_identifier or "random",
-        storage    = var.session_storage    or "cookie",
+        storage    = var.session_storage    or "redis",
         serializer = var.session_serializer or "json",
         encoder    = var.session_encoder    or "base64",
         cipher     = var.session_cipher     or "aes",
@@ -201,7 +244,8 @@ local function init()
             ssi    = enabled(var.session_check_ssi    or false),
             ua     = enabled(var.session_check_ua     or true),
             scheme = enabled(var.session_check_scheme or true),
-            addr   = enabled(var.session_check_addr   or false)
+            addr   = enabled(var.session_check_addr   or false),
+            hmac   = enabled(var.session_check_hmac   or true)
         }
     }
     defaults.secret = var.session_secret or secret
@@ -228,8 +272,10 @@ function session.new(opts)
     local g, h = prequire("resty.session.serializers.", y.serializer or z.serializer, "json")
     local i, j = prequire("resty.session.encoders.",    y.encoder    or z.encoder,    "base64")
     local k, l = prequire("resty.session.ciphers.",     y.cipher     or z.cipher,     "aes")
-    local m, n = prequire("resty.session.storage.",     y.storage    or z.storage,    "cookie")
+    local m, n = prequire("resty.session.storage.",     y.storage    or z.storage,    "redis")
     local self = {
+        basic      = ifnil(y.basic, false),
+        raw_hmac   = ifnil(y.raw_hmac, false),
         name       = y.name   or z.name,
         identifier = e,
         serializer = g,
@@ -250,7 +296,8 @@ function session.new(opts)
             ssi        = ifnil(c.ssi,        d.ssi),
             ua         = ifnil(c.ua,         d.ua),
             scheme     = ifnil(c.scheme,     d.scheme),
-            addr       = ifnil(c.addr,       d.addr)
+            addr       = ifnil(c.addr,       d.addr),
+            hmac       = ifnil(c.hmac,       d.hmac)
         }
     }
     if y[f] and not self[f] then self[f] = y[f] end
@@ -258,6 +305,7 @@ function session.new(opts)
     if y[j] and not self[j] then self[j] = y[j] end
     if y[l] and not self[l] then self[l] = y[l] end
     if y[n] and not self[n] then self[n] = y[n] end
+    self.ciphertype = l
     self.cipher  = k.new(self)
     self.storage = m.new(self)
     return setmetatable(self, session)
@@ -309,11 +357,21 @@ function session.open(opts)
         scheme
     }
     self.opened = true
-    local cookie = getcookie(self)
+    -- require aes storage cipher when self.check.hmac is false (otherwise there is nothing left to validate the session)
+    if self.check.hmac == false and self.ciphertype ~= "aes" then
+        ngx.log(ngx.ERR, "aes cipher required when check.hmac is disabled, the cipher is: ", self.ciphertype)
+        return self, false
+    end
+    local cookie
+    if self.basic then
+        cookie = getbasic(self)
+    else
+        cookie = getcookie(self)
+    end
     if cookie then
         ngx.log(ngx.DEBUG, "cookie present: ", cookie)
         local i, e, d, h = self.storage:open(cookie, self.cookie.lifetime)
-        if i and e and e > time() and d and h then
+        if i and tonumber(e) and d and h then
             ngx.log(ngx.DEBUG, "cookie session data retrieved")
             ngx.log(ngx.DEBUG, "i: " .. ngx.encode_base64(i))
             ngx.log(ngx.DEBUG, "e: " .. e .. " (time: " .. time() .. ")")
@@ -321,7 +379,9 @@ function session.open(opts)
             ngx.log(ngx.DEBUG, "h: " .. ngx.encode_base64(h))
             local k = hmac(self.secret, i)
             ngx.log(ngx.DEBUG, "k: " .. ngx.encode_base64(k))
-            d = self.cipher:decrypt(d, k, i, self.key)
+            local cryptkey = hmac(k, h)
+            ngx.log(ngx.DEBUG, "cryptkey: " .. ngx.encode_base64(cryptkey))
+            d = self.cipher:decrypt(d, cryptkey, i, self.key)
             local dkey, ds = nil, d
             if d then
                 ngx.log(ngx.DEBUG, "d decrypted: " .. d)
@@ -330,13 +390,18 @@ function session.open(opts)
                     ngx.log(ngx.DEBUG, "using d.id_token.sub in place of d in hmac: ", d.id_token.sub)
                     dkey = d.id_token.sub
                 end
+                ngx.log(ngx.DEBUG, "d.hmacsalt: ", d.hmacsalt)
+            else
+                ngx.log(ngx.DEBUG, "decryption failed")
             end
-            if ds and hmac(k, concat{ i, e, dkey or ds, self.key }) == h then
+            if ds and (self.check.hmac == false or hmac(d.hmacsalt .. k, concat{ i, dkey or ds, self.key }) == h) then
                 self.id = i
                 self.expires = e
                 self.data = type(d) == "table" and d or {}
                 self.present = true
                 return self, true
+            elseif d then
+                ngx.log(ngx.DEBUG, "hmac validation failed")
             end
         end
     end
@@ -394,6 +459,10 @@ function session:destroy()
 end
 
 function session:hide()
+    if session.basic then
+        return true
+    end
+
     local cookies = var.http_cookie
     if not cookies then
         return

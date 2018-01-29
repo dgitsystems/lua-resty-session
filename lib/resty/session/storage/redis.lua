@@ -169,9 +169,9 @@ function redis:open(cookie, lifetime)
             ok, err = self:lock(k)
             if ok then
                 local d = self:get(k)
-                if d then
-                    self:expire(k, floor(lifetime))
-                end
+--                if d then
+--                    self:expire(k, floor(lifetime))
+--                end
                 self:unlock(k)
                 self:set_keepalive()
                 return i, e, d, h
