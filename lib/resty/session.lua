@@ -461,6 +461,9 @@ end
 
 function session:destroy()
     if self.storage.destroy then
+        if self.data.id_token and not isEmpty(self.data.id_token.sub) then
+            self.storage.subkey = "sub:" .. self.redis.prefix .. ":" .. self.encoder.encode(self.data.id_token.sub)
+        end
         self.storage:destroy(self.id)
     end
     self.data      = {}

@@ -264,6 +264,19 @@ function redis:destroy(i)
         local k = self:key(i)
         self:delete(k)
         self:unlock(k)
+
+        if self.subkey then
+            local subkey = self.subkey
+
+            -- remove session key from set
+            local res, err = self.redis:zrem(subkey, k)
+            if err then
+                ngx.log(ngx.ERR, "error removing member ", k, " from redis set ", subkey, ": ", err)
+            elseif res == 1 then
+                ngx.log(ngx.DEBUG, "removed member ", k, " from redis set ", subkey)
+            end
+        end
+
         self:set_keepalive()
     end
     return ok, err
