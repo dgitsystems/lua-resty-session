@@ -130,6 +130,46 @@ function redis:get(k)
 end
 
 function redis:set(k, d, l)
+    if self.subkey then
+        local subkey = self.subkey
+        local subscore = ngx.time() + l
+
+        -- add session key to set
+        local res, err = self.redis:zadd(subkey, subscore, k)
+        if err then
+            ngx.log(ngx.ERR, "error adding member ", k, " to redis set ", subkey, " with score ", subscore, ": ", err)
+        elseif res == 0 then
+            ngx.log(ngx.DEBUG, "updated score of member ", k, " in redis set ", subkey, " to: ", subscore)
+        elseif res == 1 then
+            ngx.log(ngx.DEBUG, "added member ", k, " to redis set ", subkey, " with score: ", subscore)
+        end
+
+        -- get entry with the highest score so we can set the ttl of the set to match
+        local res, err = self.redis:zrange(subkey, -1, -1, "withscores")
+        local max_ttl
+        if err or not res[2] then
+            ngx.log(ngx.ERR, "error getting highest score (TTL) from redis set ", subkey, ": ", err)
+        else
+            ngx.log(ngx.DEBUG, "highest score for redis set ", subkey, ": ", res[2])
+            max_ttl = (res[2] - ngx.time()) * 6 -- if the max lifetime was 60 days then this will keep the set for up to 360 days of inactivity
+
+            local res, err = self.redis:expire(subkey, max_ttl)
+            if err or res ~= 1 then
+                ngx.log(ngx.ERR, "error setting timeout on redis set ", subkey, ": res=", res, " err=", err)
+            else
+                ngx.log(ngx.DEBUG, "set timeout on redis set ", subkey, ": ", max_ttl)
+            end
+        end
+
+        -- remove expires members from set
+        local min_score = ngx.time() - max_ttl -- if max lifetime was 60 days when setting max_ttl above then remove members that expired 360 days ago
+        local res, err = self.redis:zremrangebyscore(subkey, "-inf", min_score)
+        if err then
+            ngx.log(ngx.ERR, "error cleaning up expired entries in redis set ", subkey, " that expired before ", min_score, ": ", err)
+        elseif res then
+            ngx.log(ngx.DEBUG, "cleaned up ", res, " expired entries in redis set ", subkey, " that expired before: ", min_score)
+        end
+    end
     return self.redis:setex(k, l, d)
 end
 

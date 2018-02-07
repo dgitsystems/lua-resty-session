@@ -168,35 +168,48 @@ local function getcookie(session, i)
     return concat{ sub(c, 1, 4000), getcookie(session, i + 1) or "" }
 end
 
+local function getdkey(d)
+    local dkey
+    if type(d) == "table" and d.id_token ~= nil and not isEmpty(d.id_token.sub) then
+        dkey = concat{d.id_token.sub, d.id_token.auth_time}
+        ngx.log(ngx.DEBUG, "using dkey instead of d for hmac message: ", dkey)
+    end
+    return dkey
+end
+
+local function gethmackey(d)
+    local hmackey
+    if type(d) == "table" and not isEmpty(d.hmackey) then
+        hmackey = d.hmackey
+        ngx.log(ngx.DEBUG, "using hmackey from session data instead of k for hmac key: ", hmackey)
+    end
+    return hmackey
+end
+
 local function save(session, close)
     session.expires = time() + session.cookie.lifetime
     local i, e, s = session.id, session.expires, session.storage
     local k = hmac(session.secret, i)
-    if not session.data.hmacsalt then
-        session.data.hmacsalt = ngx.encode_base64(require('resty.session.identifiers.random')({}))
-    end
-    ngx.log(ngx.DEBUG, "session.data.hmacsalt = ", session.data.hmacsalt)
     local d = session.serializer.serialize(session.data)
-    local dkey
-    if session.data.id_token ~= nil and session.data.id_token.sub ~= nil and session.data.id_token.sub ~= "" then
-        ngx.log(ngx.DEBUG, "using session.data.id_token.sub in place of d in hmac: ", session.data.id_token.sub)
-        dkey = session.data.id_token.sub
-    end
-    local h = hmac(session.data.hmacsalt .. k, concat{ i, dkey or d, session.key })
+    local h = hmac(gethmackey(session.data) or k, concat{ i, getdkey(session.data) or d, session.key })
     session.hmac = h
     local cryptkey
-    if session.check.hmac == false and session.basic then
+    if session.check.hmac == false and session.raw_hmac == true and session.basic then
         cryptkey = hmac(k, ngx.var.remote_passwd)
     else
         cryptkey = hmac(k, h)
     end
-    local d = session.cipher:encrypt(d, cryptkey, i, session.key)
+    ngx.log(ngx.DEBUG, "session.secret = ", session.secret)
     ngx.log(ngx.DEBUG, "i = ", ngx.encode_base64(i))
     ngx.log(ngx.DEBUG, "e = ", e, " session.cookie.lifetime = ", session.cookie.lifetime)
     ngx.log(ngx.DEBUG, "d = ", ngx.encode_base64(d))
     ngx.log(ngx.DEBUG, "h = ", ngx.encode_base64(h))
     ngx.log(ngx.DEBUG, "k = ", ngx.encode_base64(k))
     ngx.log(ngx.DEBUG, "cryptkey = " .. ngx.encode_base64(cryptkey))
+    if session.data.id_token and not isEmpty(session.data.id_token.sub) then
+        s.subkey = "sub:" .. session.redis.prefix .. ":" .. session.encoder.encode(session.data.id_token.sub)
+    end
+    local d = session.cipher:encrypt(d, cryptkey, i, session.key)
     local cookie, err = s:save(i, e, d, h, close)
     if cookie then
         return setcookie(session, cookie)
@@ -386,15 +399,10 @@ function session.open(opts)
             if d then
                 ngx.log(ngx.DEBUG, "d decrypted: " .. d)
                 d = self.serializer.deserialize(d)
-                if d.id_token ~= nil and d.id_token.sub ~= nil and d.id_token.sub ~= "" then
-                    ngx.log(ngx.DEBUG, "using d.id_token.sub in place of d in hmac: ", d.id_token.sub)
-                    dkey = d.id_token.sub
-                end
-                ngx.log(ngx.DEBUG, "d.hmacsalt: ", d.hmacsalt)
             else
                 ngx.log(ngx.DEBUG, "decryption failed")
             end
-            if ds and (self.check.hmac == false or hmac(d.hmacsalt .. k, concat{ i, dkey or ds, self.key }) == h) then
+            if ds and (self.check.hmac == false or hmac(gethmackey(d) or k, concat{ i, getdkey(d) or ds, self.key }) == h) then
                 self.id = i
                 self.expires = e
                 self.data = type(d) == "table" and d or {}
