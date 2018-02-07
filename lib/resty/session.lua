@@ -181,7 +181,7 @@ local function gethmackey(d)
     local hmackey
     if type(d) == "table" and not isEmpty(d.hmackey) then
         hmackey = d.hmackey
-        ngx.log(ngx.DEBUG, "using hmackey from session data instead of k for hmac key: ", hmackey)
+        ngx.log(ngx.DEBUG, "using hmackey from session data instead of k, hmackey: ", hmackey)
     end
     return hmackey
 end
@@ -190,6 +190,11 @@ local function save(session, close)
     session.expires = time() + session.cookie.lifetime
     local i, e, s = session.id, session.expires, session.storage
     local k = hmac(session.secret, i)
+    if session.basic and session.check.hmac == true and isEmpty(session.data.hmackey) then
+        -- assign a random hmac key by default only when in basic auth mode
+        session.data.hmackey = ngx.encode_base64(require('resty.session.identifiers.random')({}))
+        ngx.log(ngx.DEBUG, "setting random hmackey: ", session.data.hmackey)
+    end
     local d = session.serializer.serialize(session.data)
     local h = hmac(gethmackey(session.data) or k, concat{ i, getdkey(session.data) or d, session.key })
     session.hmac = h
