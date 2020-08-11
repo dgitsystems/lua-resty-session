@@ -109,7 +109,7 @@ function redis:lock(k)
     local l = concat({ k, "lock" }, "." )
     for _ = 1, i do
         local ok = r:setnx(l, "1")
-        if ok then
+        if ok == 1 then
             return r:expire(l, m + 1)
         end
         sleep(w)
@@ -251,8 +251,8 @@ function redis:save(i, e, d, h, close)
         end
         if close then
             self:unlock(k)
-            self:set_keepalive()
         end
+        self:set_keepalive()
         return nil, "expired"
     end
     return ok, err

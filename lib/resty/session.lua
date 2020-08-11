@@ -428,6 +428,13 @@ function session.start(opts)
         return opts, opts.present
     end
     local self, present = session.open(opts)
+
+    -- force self.storage:start to be called when in basic auth mode to trigger locking
+    if self.basic then
+        self.expires = time() + self.cookie.lifetime
+        present = true
+    end
+
     if present then
         if self.storage.start then
             local ok, err = self.storage:start(self.id)
